@@ -8,9 +8,9 @@ import os
 import datetime
 import pandas as pd
 import requests
-from utils import collect_machine_info, check_active_cpu_gpu_processes, run_with_gpu_monitor, get_num_gpus
+from utils import collect_machine_info, check_active_cpu_gpu_processes, run_with_gpu_monitor, get_num_gpus, get_gpu_temps
 from benchmark_helpers import run_gpu_benchmark, run_gpu_burn, run_torch_benchmark, run_imagenet_reference
-
+import time
 
 def _get_applicable_gpu_specs(args, benchmarks):
     """
@@ -56,7 +56,7 @@ def _result_dict_to_df(result_dict):
         A DataFrame containing the benchmark results.
     """
     rows = []
-    metric_cols, monitor_cols = set(), set()
+    metric_cols, monitor_cols = [], []
 
     for gpu_spec, bm_map in result_dict.items():
         row = {"gpu_spec": gpu_spec}
@@ -65,45 +65,66 @@ def _result_dict_to_df(result_dict):
             for k, v in results.items():
                 col = f"{k}_{bm}"
                 row[col] = v
-                metric_cols.add(col)
+                if col not in metric_cols:
+                    metric_cols.append(col)
             for k, v in monitor.items():
                 col = f"{k}_{bm}"
                 row[col] = v
-                monitor_cols.add(col)
+                if col not in monitor_cols:
+                    monitor_cols.append(col)
         rows.append(row)
 
     df = pd.DataFrame(rows)
 
     # order: gpu_spec, metrics..., monitors...
-    ordered_cols = ["gpu_spec"] + sorted(metric_cols) + sorted(monitor_cols)
+    ordered_cols = ["gpu_spec"] + metric_cols + monitor_cols
     df = df.reindex(columns=ordered_cols)
 
     return df
 
 
+def _wait_gpu_temp(idle_temps, margin=10, verbose=False):
+    """
+    Halts execution until GPU temps return to within margin % of idle temps
+    or are below 60°C.
+
+    Returns seconds waited
+    """
+    start = time.time()
+    current_temps = get_gpu_temps()
+    while True:
+        if all(abs(c - i) <= margin / 100 * i for c, i in zip(current_temps, idle_temps)) or all(c <= 60 for c in current_temps):
+            break
+        if verbose:
+            target_temps = [max(i + margin / 100 * i, 60) for i in idle_temps]
+            print(f"\tCurrent temps: {current_temps}, Target temps: {target_temps}, Idle Temps: {idle_temps}")
+        time.sleep(1)
+        current_temps = get_gpu_temps()
+    return time.time() - start
+
 def run_benchmarks(args):
     benchmarks = []
-    if not args.skip_stable_diffusion:
-        benchmarks.append("sd")
     if not args.skip_gpu_burn:
         benchmarks.append("burn")
     if not args.skip_torchbench:
         benchmarks.append("tb")
     if not args.skip_imagenet_classification:
         benchmarks.append("im")
-    if len(benchmarks) == 0:
-        raise ValueError("No benchmarks specified to run")
+    if not args.skip_stable_diffusion:
+        benchmarks.append("sd")
+    # if len(benchmarks) == 0:
+    #     raise ValueError("No benchmarks specified to run")
     
     bm_fns = {
-        'sd' : run_gpu_benchmark,
-        'burn': run_gpu_burn,
         'tb'  : run_torch_benchmark,
+        'sd' : run_gpu_benchmark,
         'im'  : run_imagenet_reference,
+        'burn': run_gpu_burn,
     }
 
     
     all_gpu_specs = _get_applicable_gpu_specs(args, 'all')
-    ret_dict = {g : {bm : None for bm in benchmarks} for g in all_gpu_specs} # each entry will be (results, monitor_info)
+    ret_dict = {g : {bm : None for bm in bm_fns.keys()} for g in all_gpu_specs} # each entry will be (results, monitor_info)
 
 
     print('Checking to make sure GPU and CPU are clear')
@@ -115,21 +136,37 @@ def run_benchmarks(args):
         raise RuntimeError("CPU or GPU is busy. Please clear the processes before running benchmarks.")
     print("All clear")
 
+    idle_temps = get_gpu_temps()
+    print(f"Idle GPU temps: {idle_temps}")
 
-    for benchmark in benchmarks:
+    for benchmark in bm_fns.keys():
         bm_gpu_specs = _get_applicable_gpu_specs(args, benchmark)
         for gpu_spec in all_gpu_specs:
             return_empty=False
-            if gpu_spec not in bm_gpu_specs:
+            if gpu_spec not in bm_gpu_specs or benchmark not in benchmarks:
                 return_empty = True
             if args.verbose:
-                print(f"\n\nRunning {benchmark} on {gpu_spec}")
-            bm_results, bm_monitor_info = run_with_gpu_monitor(
-                bm_fns[benchmark],
-                gpu_spec,
-                stream=args.verbose,
-                logfile=args.logfile,
-                return_empty=return_empty)
+                if not return_empty:
+                    print(f"\n\nRunning {benchmark} on {gpu_spec}")
+                else:
+                    print(f"Skipping {benchmark} on {gpu_spec}")
+            try:
+                bm_results, bm_monitor_info = run_with_gpu_monitor(
+                    bm_fns[benchmark],
+                    gpu_spec,
+                    stream=args.verbose,
+                    logfile=args.logfile,
+                    return_empty=return_empty)
+            # except ctrl-c and delete log file before exiting 
+            except KeyboardInterrupt as e:
+                if args.logfile and os.path.exists(args.logfile):
+                    os.remove(args.logfile)
+                raise e
+            
+            print(f"Finished {benchmark} on {gpu_spec}, waiting for gpus to cool down")
+            secs_waited = _wait_gpu_temp(idle_temps, verbose=args.verbose, margin=10)
+            if bm_monitor_info is not None:
+                bm_monitor_info['cooldown_wait_s'] = secs_waited
             ret_dict[gpu_spec][benchmark] = (bm_results, bm_monitor_info)
 
     ret_df = _result_dict_to_df(ret_dict)
@@ -137,6 +174,8 @@ def run_benchmarks(args):
 
 
 def _upload_to_gsheets(args, df):
+    if args.verbose:
+        print("Uploading results to google sheets: https://docs.google.com/spreadsheets/d/1WVKt2bdIEx8Mu3fXxjMYucGKR6blENCLQnFM7-0EuwQ/edit?usp=sharing")
     URL = getattr(args, "gsheets_url", "") or ""
     if not URL:
         print("[gsheets] Skipped: no --gsheets-url provided.")
@@ -178,6 +217,16 @@ def record_results(args, res_df, timestamp, machine_info):
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
         write_header = not os.path.exists(args.out_csv)
+        # check if header matches current
+        if os.path.exists(args.out_csv):
+            with open(args.out_csv, 'r') as f:
+                reader = pd.read_csv(f, nrows=0)
+                if not reader.columns.equals(final_df.columns):
+                    print(f"[csv] Header mismatch in {args.out_csv}:")
+                    print(f"  Expected: {final_df.columns.tolist()}")
+                    print(f"  Found:    {reader.columns.tolist()}")
+                    print(f"ERROR: could not write results csv, header mismatch")
+                    return
         final_df.to_csv(args.out_csv, mode='a', header=write_header, index=False)
 
     return
@@ -196,17 +245,18 @@ if __name__ == '__main__':
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output', default=False)
     parser.add_argument('--force', action='store_true', help='Force run benchmarks even if CPU/GPU is busy', default=False)
     parser.add_argument('--runname', type=str, default='', help='Name of the run, for logging')
-    parser.add_argument('--gsheets-url', type=str, help='Google Sheets API URL', default='https://script.google.com/macros/s/AKfycbyWE17cMlYp9pgF8Y5gMTvBCZ3ppcSKz9bLxjPM2ArCTPSfJ-tvF80O2VEyUwiTLXEcEA/exec')
+    parser.add_argument('--gsheets-url', type=str, help='Google Sheets API URL', default='https://script.google.com/macros/s/AKfycbzM_i4Xx8PcKRR8H4AW7ENqNjGNHezLdQTGMkdFgoL_o_X-ZU6DcLSGDpWo50sBVLvoMg/exec')
     args = parser.parse_args()
 
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
     machine_info = collect_machine_info()
 
     if args.logfile is None:
-        args.logfile = f"benchmark_{timestamp}.log"
+        args.logfile = f".logs/benchmark_{timestamp}.log"
     elif args.logfile == "no_log":
         args.logfile = None
-
+    if args.logfile and os.path.dirname(args.logfile):
+        os.makedirs(os.path.dirname(args.logfile), exist_ok=True)
     # also prompt to confirm the selected options
     print("Selected options:")
     print(f"  GPUs: {args.gpus}")

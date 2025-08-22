@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import monotonic
 import platform
 import socket
+import shlex
 import getpass
 
 try:
@@ -327,7 +328,7 @@ def _process_gpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
         "time_to_mean": ",".join(time_to_mean_vals),
         "max_util": ",".join(max_util_vals),
         "mean_util": ",".join(mean_util_vals),
-        "max_fan": ",".join(mean_fan_vals) if False else ",".join(max_fan_vals),  # keep both lines if you prefer swap
+        "max_fan": ",".join(max_fan_vals), 
         "mean_fan": ",".join(mean_fan_vals),
         "max_power": ",".join(max_power_vals),
         "mean_power": ",".join(mean_power_vals),
@@ -339,7 +340,6 @@ def _process_gpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
     return out
 
 
-# NEW: aggregate CPU sampler (averages across all CPUs + RAM)
 def _sample_cpu_agg(sample_list: List[Dict[str, Any]],
                     stop_evt: threading.Event,
                     interval_s: float = 1.0,
@@ -428,10 +428,10 @@ def _process_cpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
       ['t','cpu_avg_util_pct','cpu_active_count','cpu_count','cpu_temp_avg_C',
        'ram_used_GB']
     Outputs (single series, not per-CPU):
-      cpu_max_temp, cpu_time_to_max, cpu_mean_temp,
+      cpu_max_temp,
       cpu_max_util, cpu_mean_util,
-      cpu_max_active, cpu_mean_active,
-      ram_max_gb, ram_mean_gb
+      cpu_mean_active,
+      ram_max_gb
     Values are strings to match GPU summary style.
     """
     def fmt(x, nd=1):
@@ -441,10 +441,11 @@ def _process_cpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
 
     if df is None or df.empty:
         return {
-            "cpu_max_temp": "", "cpu_time_to_max": "", "cpu_mean_temp": "",
-            "cpu_max_util": "", "cpu_mean_util": "",
-            "cpu_max_active": "", "cpu_mean_active": "",
-            "ram_max_gb": "", "ram_mean_gb": ""
+            "cpu_max_temp": "",
+            "cpu_max_util": "", 
+            "cpu_mean_util": "",
+            "cpu_mean_active": "",
+            "ram_max_gb": ""
         }
 
     d = df.copy().sort_values("t")
@@ -453,12 +454,12 @@ def _process_cpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
     temp_arr = pd.to_numeric(d.get("cpu_temp_avg_C"), errors="coerce").values
     if temp_arr.size and not np.all(np.isnan(temp_arr)):
         cpu_max_temp = float(np.nanmax(temp_arr))
-        idx_max = int(np.nanargmax(temp_arr))
-        t0 = float(d["t"].iloc[0])
-        cpu_time_to_max = float(d["t"].iloc[idx_max] - t0)
-        cpu_mean_temp = float(np.nanmean(temp_arr))
+        # idx_max = int(np.nanargmax(temp_arr))
+        # t0 = float(d["t"].iloc[0])
+        # cpu_time_to_max = float(d["t"].iloc[idx_max] - t0)
+        # cpu_mean_temp = float(np.nanmean(temp_arr))
     else:
-        cpu_max_temp = np.nan; cpu_time_to_max = np.nan; cpu_mean_temp = np.nan
+        cpu_max_temp = np.nan; # cpu_time_to_max = np.nan; cpu_mean_temp = np.nan
 
     # Util
     util_arr = pd.to_numeric(d.get("cpu_avg_util_pct"), errors="coerce").values
@@ -467,24 +468,20 @@ def _process_cpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
 
     # Active CPU count
     act_arr = pd.to_numeric(d.get("cpu_active_count"), errors="coerce").values
-    cpu_max_active = float(np.nanmax(act_arr)) if act_arr.size else np.nan
+    # cpu_max_active = float(np.nanmax(act_arr)) if act_arr.size else np.nan
     cpu_mean_active = float(np.nanmean(act_arr)) if act_arr.size else np.nan
 
     # RAM
     ram_used = pd.to_numeric(d.get("ram_used_GB"), errors="coerce").values
     ram_max_gb = float(np.nanmax(ram_used)) if ram_used.size else np.nan
-    ram_mean_gb = float(np.nanmean(ram_used)) if ram_used.size else np.nan
+    # ram_mean_gb = float(np.nanmean(ram_used)) if ram_used.size else np.nan
 
     return {
         "cpu_max_temp": fmt(cpu_max_temp, 1),
-        "cpu_time_to_max": fmt(cpu_time_to_max, 2),
-        "cpu_mean_temp": fmt(cpu_mean_temp, 1),
         "cpu_max_util": fmt(cpu_max_util, 1),
         "cpu_mean_util": fmt(cpu_mean_util, 1),
-        "cpu_max_active": fmt(cpu_max_active, 0),
         "cpu_mean_active": fmt(cpu_mean_active, 1),
         "ram_max_gb": fmt(ram_max_gb, 2),
-        "ram_mean_gb": fmt(ram_mean_gb, 2),
     }
 
 
@@ -557,45 +554,13 @@ def run_with_gpu_monitor(func: Callable, *args,
     if cpu_samples and pd is not None and as_dataframe:
         cpu_df = pd.DataFrame(cpu_samples)
         summary.update(_process_cpu_df(cpu_df, poll_interval_s))
-    elif cpu_samples:
-        # minimal fallback without pandas
-        # convert to DataFrame-like with numpy ops
-        try:
-            t = [rec.get("t") for rec in cpu_samples]
-            temp = np.array([rec.get("cpu_temp_avg_C", np.nan) for rec in cpu_samples], dtype=float)
-            util = np.array([rec.get("cpu_avg_util_pct", np.nan) for rec in cpu_samples], dtype=float)
-            # active = np.array([rec.get("cpu_active_count", np.nan) for rec in cpu_samples], dtype=float)
-            ram = np.array([rec.get("ram_used_GB", np.nan) for rec in cpu_samples], dtype=float)
-            def fmt(x, nd=1):
-                if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-                    return ""
-                return f"{x:.{nd}f}"
-            if len(t) and not np.all(np.isnan(temp)):
-                idx = int(np.nanargmax(temp))
-                t0 = float(t[0])
-                cpu_time_to_max = float(t[idx] - t0)
-            else:
-                cpu_time_to_max = np.nan
-            summary.update({
-                "cpu_max_temp": fmt(np.nanmax(temp), 1),
-                "cpu_time_to_max": fmt(cpu_time_to_max, 2),
-                "cpu_mean_temp": fmt(np.nanmean(temp), 1),
-                "cpu_max_util": fmt(np.nanmax(util), 1),
-                "cpu_mean_util": fmt(np.nanmean(util), 1),
-                "ram_max_gb": fmt(np.nanmax(ram), 1),
-                "ram_mean_gb": fmt(np.nanmean(ram), 1),
-            })
-        except Exception:
-            summary.update({
-                "cpu_max_temp": "", "cpu_time_to_max": "", "cpu_mean_temp": "",
-                "cpu_max_util": "", "cpu_mean_util": "",
-                "ram_max_gb": "", "ram_mean_gb": "", 
-            })
     else:
         summary.update({
-            "cpu_max_temp": "", "cpu_time_to_max": "", "cpu_mean_temp": "",
-            "cpu_max_util": "", "cpu_mean_util": "",
-            "ram_max_gb": "", "ram_mean_gb": ""
+            "cpu_max_temp": "", 
+            "cpu_max_util": "", 
+            "cpu_mean_util": "",
+            "cpu_mean_active": "",
+            "ram_max_gb": ""
         })
 
     # Attach run meta (consistent with earlier behavior)
@@ -628,7 +593,7 @@ def _cmd_for_pid(pid: int) -> str:
 
 def check_active_cpu_gpu_processes(
     cpu_threshold_pct: float = 20.0,
-    gpu_mem_threshold_mb: float = 50.0,
+    gpu_mem_threshold_mb: float = 100.0,
     include_self: bool = True,
     include_system_users: bool = False,
     cpu_sample_seconds: float = 0.25,
@@ -793,11 +758,13 @@ def run_cmd(
 
     Returns
     -------
-    dict
+    dict  
         {stdout, stderr, returncode, timed_out}
     """
+    print(f"Running command: '{cmd}'")
     if stream and shutil.which("stdbuf"):
-        cmd_to_run = f"stdbuf -oL -eL {cmd}"
+        # run everything under bash -c so builtins like `cd` work
+        cmd_to_run = f"stdbuf -oL -eL bash -c {shlex.quote(cmd)}"
     else:
         cmd_to_run = cmd
 
@@ -1109,6 +1076,7 @@ def collect_machine_info():
     info["nvidia_driver_version"] = ""
     info["cuda_driver_version"] = ""   # e.g., "12.4"
     info["cuda_runtime_version"] = ""  # from nvcc if present
+    info["gpu_idle_temps"] = ''
 
     if _NVML:
         try:
@@ -1142,6 +1110,10 @@ def collect_machine_info():
                     info["cuda_driver_version"] = f"{major}.{minor}"
             except Exception:
                 pass
+
+            # gpu temps
+            temps = get_gpu_temps()
+            info["gpu_idle_temps"] = ','.join(map(str, temps))
 
         except Exception:
             info["gpu_names"] = "Error retrieving GPU info"

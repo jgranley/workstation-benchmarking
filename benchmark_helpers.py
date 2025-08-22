@@ -27,7 +27,7 @@ def _parse_gpu_spec(gpu_spec: str):
     seen = set()
     gpus = []
     for p in parts:
-        if not p.isdigit():
+        if not p.isdigit() and p not in ['cpu']:
             raise ValueError(f"GPU '{p}' is not a valid numeric GPU ID")
         if p not in seen:
             seen.add(p)
@@ -131,12 +131,17 @@ def _parse_gpu_burn(stdout: str):
     We look for progress lines that contain both 'Gflop/s' and 'temps:'.
     Works for 1+ GPUs; when multiple GPUs, values appear separated by ' - '.
     """
+    # print("PARSING\n", stdout)
     progress = []
     max_gpus = 0
-
+    last_perc = -1 # record 1 per percent line
     for line in stdout.splitlines():
         if "Gflop/s" not in line or "temps:" not in line:
             continue
+
+        # example line: 100.0%  proc'd: 405 (26255 Gflop/s) - 405 (26545 Gflop/s)   errors: 0 - 0   temps: 87 C - 74 C
+        # extract %
+        progress_percent = float(re.findall(r"(\d+\.\d+)%", line)[0]) if re.search(r"(\d+\.\d+)%", line) else None
 
         # Extract all GFLOP/s numbers inside parentheses: "(12345 Gflop/s)"
         flops = [float(x) for x in re.findall(r"\(([\d\.]+)\s*Gflop/s\)", line)]
@@ -147,6 +152,9 @@ def _parse_gpu_burn(stdout: str):
 
         if not flops or not temps:
             continue
+        if progress_percent is None or progress_percent <= last_perc:
+            continue
+        last_perc = progress_percent
 
         n = max(len(flops), len(temps))
         max_gpus = max(max_gpus, n)
@@ -216,12 +224,15 @@ def run_gpu_burn(
             'max_gflops': "",
             'mean_gflops': "",
             'min_gflops': "",
-            'max_temps': "",
-            'mean_temps': "",
-            'min_temps': ""
+            # 'max_temps': "", # get temps from MONITOR INFO
+            # 'mean_temps': "",
+            # 'min_temps': ""
         }
-    burn_dir = "./gpu-burn"
-    exe_path = os.path.join(burn_dir, "gpu-burn")
+    if stream:
+        print("GPU Burn streaming not supported")
+        stream = False  # gpu-burn output is too verbose for streaming
+    burn_dir = "gpu-burn"
+    exe_path = os.path.join(burn_dir, "gpu_burn")
     if not (os.path.exists(exe_path) and os.access(exe_path, os.X_OK)):
         raise FileNotFoundError(f"gpu-burn executable not found or not executable: {exe_path}")
 
@@ -230,7 +241,7 @@ def run_gpu_burn(
 
     # Build command
     if n == 1:
-        cmd = f"cd {burn_dir} && ./gpu-burn -i {gpus[0]} {int(seconds)}"
+        cmd = f"cd {burn_dir} && ./gpu_burn -i {gpus[0]} {int(seconds)}"
     else:
         # When multiple gpus are specified, gpu-burn runs on all available GPUs
         total_gpus = get_num_gpus()
@@ -238,7 +249,7 @@ def run_gpu_burn(
         if total_gpus and n != total_gpus:
             print(f"Warning: gpu-burn will ignore selection {gpus} and burn ALL {total_gpus} GPUs")
 
-        cmd = f"cd {burn_dir} && ./gpu-burn {int(seconds)}"
+        cmd = f"cd {burn_dir} && ./gpu_burn {int(seconds)}"
 
     # Execute
     res = run_cmd(cmd, stream=stream, logfile=logfile)
@@ -247,12 +258,12 @@ def run_gpu_burn(
     gflops, temps = _parse_gpu_burn(res["stdout"])
 
     ret = {
-        'max_gflops': ','.join(gflops.max(axis=0).astype(str)),
-        'mean_gflops': ','.join(gflops.mean(axis=0).astype(str)),
-        'min_gflops': ','.join(gflops.min(axis=0).astype(str)),
-        'max_temps': ','.join(temps.max(axis=0).astype(str)),
-        'mean_temps': ','.join(temps.mean(axis=0).astype(str)),
-        'min_temps': ','.join(temps.min(axis=0).astype(str)),
+        'max_gflops': ','.join(f"{v:.1f}" for v in gflops.max(axis=0)),
+        'mean_gflops': ','.join(f"{v:.1f}" for v in gflops.mean(axis=0)),
+        'min_gflops': ','.join(f"{v:.1f}" for v in gflops.min(axis=0)),
+        # 'max_temps': ','.join(f"{v:.1f}" for v in temps.max(axis=0)),
+        # 'mean_temps': ','.join(f"{v:.1f}" for v in temps.mean(axis=0)),
+        # 'min_temps': ','.join(f"{v:.1f}" for v in temps.min(axis=0)),
     }
 
     return ret
@@ -327,7 +338,7 @@ def run_torch_benchmark(gpu_spec, stream=True, logfile=None, return_empty=False)
     dict
         A dictionary containing the benchmark results.
     """
-    cpu_mode = (gpu_spec.strip() == "")
+    cpu_mode = (gpu_spec.strip() == "cpu")
     tests = _tests_for_mode(cpu_mode)
     names_set = set(tests)
     kexpr = _k_expr(tests)
@@ -529,12 +540,14 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
     """
     io_workers = [1, 2, 4, 8, 16, 32]
     if return_empty:
-        return {"img/s" : "",
+        ret = {"img/s" : "",
                 "tot_time_m" : "",
                 "data_s" : "",
                 "iter_s" : "",
                 "acc5" : "",
-               }.update({f"IO_{jw}_{suffix}": "" for jw in io_workers for suffix in ["data_time", "iter_time"]})
+               }
+        ret.update({f"IO_{jw}_{suffix}": "" for jw in io_workers for suffix in ["data_time", "iter_time"]})
+        return ret
 
     # make sure IMAGENET env variable is set
     if "IMAGENET" not in os.environ:
@@ -557,7 +570,7 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
         # add_batch controls whether we include --batch-size 128 (only for full-run)
         base = (
             f'torchrun --nproc_per_node={int(nproc)} '
-            f'train.py --model mobilenet_v3_small '
+            f'vision/references/classification/train.py --model mobilenet_v3_small '
             f'--data-path {shlex.quote(imagenet)} '
             f'-j {int(workers)} --epochs 1'
         )
@@ -586,6 +599,8 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
         env_prefix = f'CUDA_VISIBLE_DEVICES="{",".join(gpus)}" '
         cmd = env_prefix + build_cmd(nproc=nproc, workers=16, add_batch=True)
         res = run_cmd(cmd, stream=stream, logfile=logfile)
+        if res['returncode'] != 0:
+            raise RuntimeError(f"Imagenet classification for spec {gpu_spec} failed")
         m_img, t_min, m_data, m_it, acc5 = summarize(res["stdout"], drop_first=False)
         out["img/s"] = str(m_img)
         out["tot_time_m"] = str(t_min)
