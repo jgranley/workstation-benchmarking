@@ -45,38 +45,44 @@ def _result_dict_to_df(result_dict):
     """
     Convert the result dictionary to a pandas DataFrame.
 
-    Parameters
-    ----------
-    result_dict : dict
-        The result dictionary containing GPU specs and their corresponding benchmark results.
-
-    Returns
-    -------
-    pd.DataFrame
-        A DataFrame containing the benchmark results.
+    Column order is deterministic regardless of input order:
+      metrics first, then monitors, with benchmarks ordered as:
+      gpu-burn (_burn), imagenet (_im), torchbench (_tb), stable diffusion (_sd).
     """
     rows = []
-    metric_cols, monitor_cols = [], []
+
+    # Keep per-benchmark insertion order for columns we see
+    metric_by_bm = {"burn": [], "im": [], "tb": [], "sd": []}
+    monitor_by_bm = {"burn": [], "im": [], "tb": [], "sd": []}
 
     for gpu_spec, bm_map in result_dict.items():
         row = {"gpu_spec": gpu_spec}
-        for bm in bm_map.keys():
+        for bm in bm_map.keys():  # bm in {"burn","im","tb","sd"}
             results, monitor = bm_map[bm]
+            # Metrics
             for k, v in results.items():
                 col = f"{k}_{bm}"
                 row[col] = v
-                if col not in metric_cols:
-                    metric_cols.append(col)
+                if col not in metric_by_bm[bm]:
+                    metric_by_bm[bm].append(col)
+            # Monitor info
             for k, v in monitor.items():
                 col = f"{k}_{bm}"
                 row[col] = v
-                if col not in monitor_cols:
-                    monitor_cols.append(col)
+                if col not in monitor_by_bm[bm]:
+                    monitor_by_bm[bm].append(col)
         rows.append(row)
 
     df = pd.DataFrame(rows)
 
-    # order: gpu_spec, metrics..., monitors...
+    # Deterministic benchmark order
+    bm_order = ["burn", "im", "tb", "sd"]
+
+    # Flatten the per-benchmark lists in the desired order
+    metric_cols = [col for bm in bm_order for col in metric_by_bm[bm]]
+    monitor_cols = [col for bm in bm_order for col in monitor_by_bm[bm]]
+
+    # Final column order: gpu_spec, metrics..., monitors...
     ordered_cols = ["gpu_spec"] + metric_cols + monitor_cols
     df = df.reindex(columns=ordered_cols)
 
@@ -116,10 +122,10 @@ def run_benchmarks(args):
     #     raise ValueError("No benchmarks specified to run")
     
     bm_fns = {
-        'tb'  : run_torch_benchmark,
-        'sd' : run_gpu_benchmark,
         'im'  : run_imagenet_reference,
+        'tb'  : run_torch_benchmark,
         'burn': run_gpu_burn,
+        'sd' : run_gpu_benchmark,
     }
 
     
@@ -240,8 +246,8 @@ if __name__ == '__main__':
     parser.add_argument('--skip-torchbench', action='store_true', help='Skip TorchBench benchmark', default=False)
     parser.add_argument('--skip-imagenet-classification', action='store_true', help='Skip ImageNet Classification benchmark', default=False)
     parser.add_argument('--logfile', type=str, default=None, help='Path to the log file. Use no_log to disable logging')
-    parser.add_argument('--out_csv', type=str, default=None, help='Path to output CSV file, if desired')
-    parser.add_argument('--no_upload', action='store_true', help='Dont upload results to the google sheet', default=False)
+    parser.add_argument('--out-csv', type=str, default=None, help='Path to output CSV file, if desired')
+    parser.add_argument('--no-upload', action='store_true', help='Dont upload results to the google sheet', default=False)
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose output', default=False)
     parser.add_argument('--force', action='store_true', help='Force run benchmarks even if CPU/GPU is busy', default=False)
     parser.add_argument('--runname', type=str, default='', help='Name of the run, for logging')

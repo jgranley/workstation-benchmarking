@@ -2,6 +2,7 @@
 Util functions: get_gpu_temps, run_with_gpu_monitor, check_active_cpu_gpu_processes, run_cmd, run_cmds_parallel
 """
 # pip install nvidia-ml-py3 
+import re
 import time, threading, traceback
 from typing import Any, Callable, Dict, List, Tuple, Optional, Union
 import os
@@ -186,11 +187,6 @@ def _process_gpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
         if col in d.columns:
             d[col] = pd.to_numeric(d[col], errors="coerce")
 
-    # Helper to format numbers consistently
-    def fmt(x, nd=1):
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return ""
-        return f"{x:.{nd}f}"
 
     # Per-GPU results kept in lists (then joined with commas)
     order = sorted(d["gpu"].dropna().unique().tolist())
@@ -322,20 +318,20 @@ def _process_gpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
 
     # Build output dict with comma-separated strings
     out = {
-        "max_temp": ",".join(max_temp_vals),
-        "time_to_max": ",".join(time_to_max_vals),
-        "mean_temp": ",".join(mean_temp_vals),
-        "time_to_mean": ",".join(time_to_mean_vals),
-        "max_util": ",".join(max_util_vals),
-        "mean_util": ",".join(mean_util_vals),
-        "max_fan": ",".join(max_fan_vals), 
-        "mean_fan": ",".join(mean_fan_vals),
-        "max_power": ",".join(max_power_vals),
-        "mean_power": ",".join(mean_power_vals),
+        "max_temp": ",".join(fmt(v, 1) for v in max_temp_vals),
+        "time_to_max": ",".join(fmt(v, 2) for v in time_to_max_vals),
+        "mean_temp": ",".join(fmt(v, 1) for v in mean_temp_vals),
+        "time_to_mean": ",".join(fmt(v, 2) for v in time_to_mean_vals),
+        "max_util": ",".join(fmt(v, 1) for v in max_util_vals),
+        "mean_util": ",".join(fmt(v, 1) for v in mean_util_vals),
+        "max_fan": ",".join(fmt(v, 1) for v in max_fan_vals), 
+        "mean_fan": ",".join(fmt(v, 1) for v in mean_fan_vals),
+        "max_power": ",".join(fmt(v, 1) for v in max_power_vals),
+        "mean_power": ",".join(fmt(v, 1) for v in mean_power_vals),
         "throttled": ",".join(throttled_flags),
-        "time_throttled": ",".join(time_throttled_vals),
-        "time_to_throttle": ",".join(time_to_throttle_vals),
-        "throttle_amount": ",".join(throttle_amount_vals),
+        "time_throttled": ",".join(fmt(v, 2) for v in time_throttled_vals),
+        "time_to_throttle": ",".join(fmt(v, 2) for v in time_to_throttle_vals),
+        "throttle_amount": ",".join(fmt(v, 2) for v in throttle_amount_vals),
     }
     return out
 
@@ -408,19 +404,28 @@ def _sample_cpu_agg(sample_list: List[Dict[str, Any]],
             ram_pct = float(vm.percent) if vm else np.nan
 
             sample_list.append({
-                "t": ts,
-                "cpu_avg_util_pct": cpu_avg,
-                "cpu_active_count": cpu_active,
+                "t": fmt(ts, 2),
+                "cpu_avg_util_pct": fmt(cpu_avg, 1),
+                "cpu_active_count": fmt(cpu_active, 0),
                 "cpu_count": cpu_count,
-                "cpu_temp_avg_C": cpu_temp,
-                "chipset_temp_avg_C": chipset_temp,
-                "ram_used_GB": ram_used,
+                "cpu_temp_avg_C": fmt(cpu_temp, 1),
+                "chipset_temp_avg_C": fmt(chipset_temp, 1),
+                "ram_used_GB": fmt(ram_used, 1),
             })
         except Exception:
             pass
         stop_evt.wait(interval_s)
 
-
+def fmt(x, nd=1):
+    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+        return ""
+    if isinstance(x, str):
+        try:
+            xx = float(x)
+            return f"{xx:.{nd}f}"
+        except ValueError:
+            return x
+    return f"{x:.{nd}f}"
 
 def _process_cpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str]:
     """
@@ -434,10 +439,7 @@ def _process_cpu_df(df: pd.DataFrame, sample_interval_s: float) -> Dict[str, str
       ram_max_gb
     Values are strings to match GPU summary style.
     """
-    def fmt(x, nd=1):
-        if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
-            return ""
-        return f"{x:.{nd}f}"
+    
 
     if df is None or df.empty:
         return {
@@ -722,11 +724,11 @@ def check_active_cpu_gpu_processes(
     }
 
 
-
 def _reader(pipe, sink, buf):
     try:
         for line in iter(pipe.readline, ''):
             if sink:
+                # print(line)
                 sink.write(line)
                 sink.flush()
             buf.write(line)
@@ -762,9 +764,14 @@ def run_cmd(
         {stdout, stderr, returncode, timed_out}
     """
     print(f"Running command: '{cmd}'")
-    if stream and shutil.which("stdbuf"):
-        # run everything under bash -c so builtins like `cd` work
-        cmd_to_run = f"stdbuf -oL -eL bash -c {shlex.quote(cmd)}"
+    if stream:
+        # if shutil.which("script"):
+        #     # PTY: child thinks it's interactive; updates line-by-line
+        #     cmd_to_run = f"script -qfec {shlex.quote(cmd)} /dev/null"
+        if shutil.which("stdbuf"):
+            cmd_to_run = f"stdbuf -oL -eL bash -c {shlex.quote(cmd)}"
+        else:
+            cmd_to_run = f"bash -lc {shlex.quote(cmd)}"
     else:
         cmd_to_run = cmd
 
@@ -789,24 +796,43 @@ def run_cmd(
     timed_out = False
     start = monotonic()
     try:
-        if timeout is None:
-            proc.wait()
+        if stream:
+            # your existing wait loop is fine when stream=True (pipes drained by threads)
+            if timeout is None:
+                proc.wait()
+            else:
+                remaining = timeout
+                while proc.poll() is None and remaining > 0:
+                    try:
+                        proc.wait(timeout=min(0.1, remaining))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    remaining = timeout - (monotonic() - start)
+                if proc.poll() is None:
+                    timed_out = True
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
         else:
-            remaining = timeout
-            while proc.poll() is None and remaining > 0:
+            # IMPORTANT: when not streaming, drain pipes via communicate()
+            if timeout is None:
+                out, err = proc.communicate()
+            else:
                 try:
-                    proc.wait(timeout=min(0.1, remaining))
+                    out, err = proc.communicate(timeout=timeout)
                 except subprocess.TimeoutExpired:
-                    pass
-                remaining = timeout - (monotonic() - start)
-            if proc.poll() is None:
-                timed_out = True
-                os.killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                    proc.wait()
+                    timed_out = True
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        out, err = proc.communicate(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        out, err = proc.communicate()
+            out_buf.write(out or "")
+            err_buf.write(err or "")
     except KeyboardInterrupt:
         try:
             os.killpg(proc.pid, signal.SIGINT)
@@ -824,10 +850,10 @@ def run_cmd(
             except Exception:
                 pass
 
-    if not stream:
-        out, err = proc.communicate()
-        out_buf.write(out or "")
-        err_buf.write(err or "")
+    # if not stream:
+    #     out, err = proc.communicate()
+    #     out_buf.write(out or "")
+    #     err_buf.write(err or "")
 
     result = {
         "stdout": out_buf.getvalue(),

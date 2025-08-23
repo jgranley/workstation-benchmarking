@@ -214,9 +214,6 @@ def run_gpu_burn(
             'max_gflops': str,
             'mean_gflops': str,
             'min_gflops': str,
-            'max_temps': str,
-            'mean_temps': str,
-            'min_temps': str
         }
     """
     if return_empty:
@@ -256,6 +253,7 @@ def run_gpu_burn(
 
     # Parse stdout into arrays
     gflops, temps = _parse_gpu_burn(res["stdout"])
+    print(f"Gflops: ", gflops)
 
     ret = {
         'max_gflops': ','.join(f"{v:.1f}" for v in gflops.max(axis=0)),
@@ -430,7 +428,7 @@ def run_torch_benchmark(gpu_spec, stream=True, logfile=None, return_empty=False)
                 v = rec.get(m) if rec else float("nan")
                 vals_by_metric[m].append(v)
         for m in metrics:
-            flat[f"{short}_{suffix_map[m]}"] = ",".join(str(x) for x in vals_by_metric[m])
+            flat[f"{short}_{suffix_map[m]}"] = ",".join(f"{x:.2f}" for x in vals_by_metric[m])
 
     # Cleanup JSON files
     for jp in json_paths.values():
@@ -568,8 +566,8 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
 
     def build_cmd(nproc, workers, add_batch=False):
         # add_batch controls whether we include --batch-size 128 (only for full-run)
-        base = (
-            f'torchrun --nproc_per_node={int(nproc)} '
+        base = f'torchrun --nproc_per_node={int(nproc)} ' if nproc > 1 else 'python3 '
+        base += (
             f'vision/references/classification/train.py --model mobilenet_v3_small '
             f'--data-path {shlex.quote(imagenet)} '
             f'-j {int(workers)} --epochs 1'
@@ -602,16 +600,20 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
         if res['returncode'] != 0:
             raise RuntimeError(f"Imagenet classification for spec {gpu_spec} failed")
         m_img, t_min, m_data, m_it, acc5 = summarize(res["stdout"], drop_first=False)
-        out["img/s"] = str(m_img)
-        out["tot_time_m"] = str(t_min)
-        out["data_s"] = str(m_data)
-        out["iter_s"] = str(m_it)
-        out["acc5"] = str(acc5)
+        out["img/s"] = f"{m_img:.1f}"
+        out["tot_time_m"] = f"{t_min:.1f}"
+        out["data_s"] = f"{m_data:.3f}"
+        out["iter_s"] = f"{m_it:.3f}"
+        out["acc5"] = f"{acc5:.2f}"
     else:
         cmds = []
         for g in gpus:
             env_prefix = f'CUDA_VISIBLE_DEVICES="{g}" '
-            cmds.append(env_prefix + build_cmd(nproc=1, workers=16, add_batch=True))
+            if len(gpus) == 1:
+                nworkers = 16
+            else: 
+                nworkers = 8
+            cmds.append(env_prefix + build_cmd(nproc=1, workers=nworkers, add_batch=True))
         if len(cmds) == 1:
             res_list = [run_cmd(cmds[0], stream=stream, logfile=logfile)]
         else:
@@ -620,11 +622,11 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
         for r in res_list:
             m_img, t_min, m_data, m_it, acc5 = summarize(r["stdout"], drop_first=False)
             vals_img.append(m_img); vals_tot.append(t_min); vals_data.append(m_data); vals_it.append(m_it); vals_acc5.append(acc5)
-        out["img/s"] = ",".join(str(v) for v in vals_img)
-        out["tot_time_m"] = ",".join(str(v) for v in vals_tot)
-        out["data/s"] = ",".join(str(v) for v in vals_data)
-        out["iter/s"] = ",".join(str(v) for v in vals_it)
-        out["acc5"] = ",".join(str(v) for v in vals_acc5)
+        out["img/s"] = ",".join(f"{v:.1f}" for v in vals_img)
+        out["tot_time_m"] = ",".join(f"{v:.1f}" for v in vals_tot)
+        out["data/s"] = ",".join(f"{v:.3f}" for v in vals_data)
+        out["iter/s"] = ",".join(f"{v:.3f}" for v in vals_it)
+        out["acc5"] = ",".join(f"{v:.2f}" for v in vals_acc5)
 
     # =========================
     # Phase 2: I/O sweeps
@@ -635,10 +637,10 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
             nproc = len(gpus)
             env_prefix = f'CUDA_VISIBLE_DEVICES="{",".join(gpus)}" '
             cmd = env_prefix + build_cmd(nproc=nproc, workers=jw, add_batch=False)  # default batch size
-            r = run_cmd(cmd, stream=stream, logfile=logfile, timeout=30)
+            r = run_cmd(cmd, stream=stream, logfile=logfile, timeout=45)
             _m_img, _t_min, m_data, m_it, _acc5 = summarize(r["stdout"], drop_first=True)
-            out[f"IO_{jw}_data_time"] = str(m_data)
-            out[f"IO_{jw}_iter_time"] = str(m_it)
+            out[f"IO_{jw}_data_time"] = f"{m_data:.3f}"
+            out[f"IO_{jw}_iter_time"] = f"{m_it:.3f}"
         else:
             cmds = []
             for g in gpus:
@@ -652,8 +654,8 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
             for r in res_list:
                 _m_img, _t_min, m_data, m_it, _acc5 = summarize(r["stdout"], drop_first=True)
                 vals_data.append(m_data); vals_it.append(m_it)
-            out[f"IO_{jw}_data_time"] = ",".join(str(v) for v in vals_data)
-            out[f"IO_{jw}_iter_time"] = ",".join(str(v) for v in vals_it)
+            out[f"IO_{jw}_data_time"] = ",".join(f"{v:.3f}" for v in vals_data)
+            out[f"IO_{jw}_iter_time"] = ",".join(f"{v:.3f}" for v in vals_it)
 
     return out
     
