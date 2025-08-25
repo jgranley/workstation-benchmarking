@@ -292,9 +292,9 @@ def _parse_pytest_bench_json(path, names_set):
             continue
         s = b.get("stats", {}) or {}
         out[name] = {
-            "mean": float(s.get("mean", float("nan"))),
-            "max": float(s.get("max", float("nan"))),
-            "stddev": float(s.get("stddev", float("nan"))),
+            "mean": float(s.get("mean", float("nan")))*1000,
+            "max": float(s.get("max", float("nan")))*1000,
+            "stddev": float(s.get("stddev", float("nan")))*1000,
         }
     return out
 
@@ -536,7 +536,7 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
       dict of flat key->string values. For parallel per-GPU, values are comma-separated (GPU order).
       For multiprocessing mode, single values are returned (rank0 prints).
     """
-    io_workers = [1, 2, 4, 8, 16, 32]
+    io_workers = [1, 2, 4, 8, 16]
     if return_empty:
         ret = {"img/s" : "",
                 "tot_time_m" : "",
@@ -624,8 +624,8 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
             vals_img.append(m_img); vals_tot.append(t_min); vals_data.append(m_data); vals_it.append(m_it); vals_acc5.append(acc5)
         out["img/s"] = ",".join(f"{v:.1f}" for v in vals_img)
         out["tot_time_m"] = ",".join(f"{v:.1f}" for v in vals_tot)
-        out["data/s"] = ",".join(f"{v:.3f}" for v in vals_data)
-        out["iter/s"] = ",".join(f"{v:.3f}" for v in vals_it)
+        out["data_s"] = ",".join(f"{v:.3f}" for v in vals_data)
+        out["iter_s"] = ",".join(f"{v:.3f}" for v in vals_it)
         out["acc5"] = ",".join(f"{v:.2f}" for v in vals_acc5)
 
     # =========================
@@ -637,7 +637,7 @@ def run_imagenet_reference(gpu_spec, stream=True, logfile=None, return_empty=Fal
             nproc = len(gpus)
             env_prefix = f'CUDA_VISIBLE_DEVICES="{",".join(gpus)}" '
             cmd = env_prefix + build_cmd(nproc=nproc, workers=jw, add_batch=False)  # default batch size
-            r = run_cmd(cmd, stream=stream, logfile=logfile, timeout=45)
+            r = run_cmd(cmd, stream=stream, logfile=logfile, timeout=95)
             _m_img, _t_min, m_data, m_it, _acc5 = summarize(r["stdout"], drop_first=True)
             out[f"IO_{jw}_data_time"] = f"{m_data:.3f}"
             out[f"IO_{jw}_iter_time"] = f"{m_it:.3f}"

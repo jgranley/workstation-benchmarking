@@ -151,6 +151,8 @@ def run_benchmarks(args):
             return_empty=False
             if gpu_spec not in bm_gpu_specs or benchmark not in benchmarks:
                 return_empty = True
+            if benchmark == 'im' and ',' in gpu_spec and args.skip_dual_imagenet:
+                return_empty = True
             if args.verbose:
                 if not return_empty:
                     print(f"\n\nRunning {benchmark} on {gpu_spec}")
@@ -168,6 +170,9 @@ def run_benchmarks(args):
                 if args.logfile and os.path.exists(args.logfile):
                     os.remove(args.logfile)
                 raise e
+            if return_empty:
+                for k in bm_monitor_info:
+                    bm_monitor_info[k] = ""
             
             print(f"Finished {benchmark} on {gpu_spec}, waiting for gpus to cool down")
             secs_waited = _wait_gpu_temp(idle_temps, verbose=args.verbose, margin=10)
@@ -252,6 +257,7 @@ if __name__ == '__main__':
     parser.add_argument('--force', action='store_true', help='Force run benchmarks even if CPU/GPU is busy', default=False)
     parser.add_argument('--runname', type=str, default='', help='Name of the run, for logging')
     parser.add_argument('--gsheets-url', type=str, help='Google Sheets API URL', default='https://script.google.com/macros/s/AKfycbzM_i4Xx8PcKRR8H4AW7ENqNjGNHezLdQTGMkdFgoL_o_X-ZU6DcLSGDpWo50sBVLvoMg/exec')
+    parser.add_argument('--skip-dual-imagenet', action='store_true', help='Skip Dual ImageNet benchmark', default=False)
     args = parser.parse_args()
 
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H_%M_%S")

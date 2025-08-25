@@ -686,7 +686,7 @@ def check_active_cpu_gpu_processes(
                         continue
                     user = _username_for_pid(pid) or "unknown"
                     # skip if command has xorg in it
-                    if "xorg" in _cmd_for_pid(pid).lower():
+                    if "xorg" in _cmd_for_pid(pid).lower() or 'gnome-shell' in _cmd_for_pid(pid).lower():
                         # print(f"\tSkipping xorg process: {pid}")
                         continue
                     if not include_system_users and user not in non_system_users:
